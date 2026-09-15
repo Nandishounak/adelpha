@@ -34,6 +34,7 @@ import {
   Switch,
   TextInput,
   UseModelColorsRow,
+  PolishedFinishRow,
   ViewportBgRow,
 } from "./settings/controls";
 import { GoogleApiKeySection } from "./settings/GoogleApiKeySection";
@@ -46,6 +47,7 @@ import {
 import { fetchSequences } from "./mri/api";
 import type { SequenceInfo } from "./mri/types";
 import { ScannerHardwareSection } from "./settings/ScannerHardwareSection";
+import { MriDataDirectorySection } from "./settings/MriDataDirectorySection";
 import { UpdatesSection } from "./settings/UpdatesSection";
 import { INITIAL_DRAFT, type Draft, type PatchDraft } from "./settings/draft";
 
@@ -125,7 +127,7 @@ const PANEL_COPY: Record<SettingsSectionId, { title: string; subtitle: string }>
   },
   "imaging-console": {
     title: "Imaging Console",
-    subtitle: "Theme, scanner hardware, and acquisition defaults for the connected Red Pitaya.",
+    subtitle: "Theme, study data folder, scanner hardware, and acquisition defaults.",
   },
   "digital-twin": {
     title: "Digital Twin",
@@ -435,6 +437,7 @@ function GenericPanel({
           <SettingsSection title="Appearance">
             <ConsoleThemeRow />
           </SettingsSection>
+          <MriDataDirectorySection />
           <ScannerHardwareSection />
           <SettingsSection title="Acquisition">
             <DefaultSequenceRow value={draft.defaultSequence} onChange={(v) => patch("defaultSequence", v)} />
@@ -468,6 +471,7 @@ function GenericPanel({
           <SettingsSection title="Viewport">
             <ViewportBgRow />
             <UseModelColorsRow />
+            <PolishedFinishRow />
             <OrbitModeRow />
           </SettingsSection>
           <SettingsSection title="Observer">
