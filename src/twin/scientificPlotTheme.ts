@@ -99,8 +99,13 @@ export function buildScientificPlotOption(
   if (!trace) return {};
   const xSpan = Math.abs(trace.xmax - trace.xmin);
   const ySpan = Math.abs(trace.ymax - trace.ymin);
-  const named = trace.series.some((s) => s.name);
+  const named = trace.series.some((s) => {
+    const name = s.name?.trim();
+    return Boolean(name) && name !== trace.title && name !== trace.ylabel;
+  });
   const hasTitle = Boolean(trace.title) && !compact;
+  const yName = Boolean(!compact && trace.ylabel);
+  const xName = Boolean(!compact && trace.xlabel);
   return {
     backgroundColor: PLOT_BG,
     animation: false,
@@ -118,10 +123,10 @@ export function buildScientificPlotOption(
         }
       : undefined,
     grid: {
-      left: compact ? 6 : fullY ? 80 : 48,
+      left: compact ? 6 : fullY ? (yName ? 96 : 80) : yName ? 68 : 48,
       right: compact ? 6 : 16,
       top: compact ? 6 : hasTitle ? 34 : 12,
-      bottom: compact ? 6 : 28,
+      bottom: compact ? 6 : xName ? 36 : 28,
       containLabel: false,
     },
     tooltip: compact
@@ -156,7 +161,9 @@ export function buildScientificPlotOption(
             return `${xLine}  ·  ${yLine}`;
           },
         },
-    legend: named && !compact ? { show: true, textStyle: { color: PLOT_TICK }, top: 6, right: 28 } : { show: false },
+    legend: named && !compact
+      ? { show: true, left: "right", top: 6, right: 28, textStyle: { color: PLOT_TICK } }
+      : { show: false },
     toolbox: compact
       ? { show: false }
       : {
@@ -198,8 +205,11 @@ export function buildScientificPlotOption(
       type: "value",
       min: trace.ymin,
       max: trace.ymax,
-      name: compact ? undefined : trace.ylabel || undefined,
-      nameTextStyle: { color: PLOT_TICK, fontSize: 11 },
+      name: yName ? trace.ylabel : undefined,
+      nameLocation: "middle",
+      nameGap: yName ? (fullY ? 72 : 52) : 0,
+      nameRotate: 90,
+      nameTextStyle: { color: PLOT_TICK, fontSize: 11, align: "center", verticalAlign: "middle" },
       scale: false,
       axisLine: { lineStyle: { color: PLOT_BORDER, width: 1 } },
       axisTick: { show: true, lineStyle: { color: PLOT_TICK, width: 1 } },
