@@ -1,16 +1,16 @@
-"""Play a .seq file staged with ``scripts/load_seq.py``.
+"""Play a Pulseq .seq file chosen in the Imaging Console.
 
-The script checks a file and copies it into ``<MRI4ALL_BASE>/seq_library/``.
-This sequence plays whichever library file ``param_seq_file`` names; the
-default ``latest`` is the most recently loaded one, so the usual flow is just
-"add Run .seq file, then scan".
+Browse in the SEQUENCE tab (or run ``scripts/load_seq.py``) to check a file and
+copy it into ``<MRI4ALL_BASE>/seq_library/``. This sequence plays whichever
+library file ``param_seq_file`` names; the default ``latest`` is the most
+recently loaded one.
 """
 
 import os
 import pickle
 import shutil
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -77,6 +77,93 @@ def library_dir() -> Path:
     return Path(runtime.get_base_path()) / LIBRARY_DIRNAME
 
 
+def library_filename(name: str) -> str:
+    """Safe ``*.seq`` name that cannot escape the library directory."""
+    stem = Path(name or "sequence").name
+    if not stem.lower().endswith(".seq"):
+        stem = f"{Path(stem).stem or 'sequence'}.seq"
+    return stem
+
+
+def stage_seq_file(source: Path, name: Optional[str] = None) -> Path:
+    """Copy ``source`` into the session library and mark it as latest."""
+    library = library_dir()
+    library.mkdir(parents=True, exist_ok=True)
+    dest = library / library_filename(name or source.name)
+    shutil.copyfile(source, dest)
+    (library / LATEST_POINTER).write_text(dest.name, encoding="utf-8")
+    return dest
+
+
+def check_seq_file(seq_path: Path, plot_path: Optional[Path] = None) -> List[str]:
+    """Return problems; empty means the session can play the file."""
+    import numpy as np
+    import pypulseq as pp
+
+    import external.seq.adjustments_acq.config as cfg
+    from external.flocra_pulseq.interpreter_pp import seq2flocra
+
+    problems: List[str] = []
+    seq = pp.Sequence()
+    try:
+        seq.read(str(seq_path))
+    except Exception as exc:
+        return [f"could not read the file: {exc}"]
+
+    ok, report = seq.check_timing()
+    if not ok:
+        log.warning("Timing checker flagged %s: %s", seq_path.name, "; ".join(str(x) for x in report))
+
+    has_adc = any(getattr(seq.get_block(i), "adc", None) is not None for i in seq.block_events)
+    if not has_adc:
+        return problems + ["no ADC event; the interpreter needs at least one"]
+
+    rf_max, g_max = float(cfg.RF_MAX), (float(cfg.GX_MAX), float(cfg.GY_MAX), float(cfg.GZ_MAX))
+    system = pp.Opts(
+        max_grad=max(g_max),
+        grad_unit="Hz/m",
+        rf_ringdown_time=20e-6,
+        rf_dead_time=100e-6,
+        adc_dead_time=20e-6,
+        rf_raster_time=1e-6,
+        grad_raster_time=10e-6,
+        block_duration_raster=1e-6,
+    )
+    psi = seq2flocra(
+        center_freq=float(cfg.LARMOR_FREQ) * 1e6,
+        rf_amp_max=rf_max,
+        system=system,
+        clk_freq=122.88,
+        gx_max=g_max[0],
+        gy_max=g_max[1],
+        gz_max=g_max[2],
+    )
+    try:
+        psi.load_seqfile(str(seq_path))
+        psi.block_events_to_amps_times()
+    except Exception as exc:
+        return problems + [f"interpreter failed: {type(exc).__name__}: {exc}"]
+
+    for channel, (_, amps) in psi._flo_dict.items():
+        peak = float(np.abs(np.asarray(amps)).max())
+        if channel != "tx_gate" and channel != "rx0_en" and peak > 1.0:
+            problems.append(f"{channel} peaks at {peak:.2f}x DAC full scale; it would clip")
+
+    duration = seq.duration()[0]
+    log.info(
+        "%s: %s blocks, %.3f s, calibration %.4f MHz / RF_MAX %.0f Hz",
+        seq_path.name,
+        len(seq.block_events),
+        duration,
+        float(cfg.LARMOR_FREQ),
+        rf_max,
+    )
+
+    if plot_path is not None:
+        instructions_figure(psi._flo_dict, title=seq_path.name).savefig(plot_path, dpi=110)
+    return problems
+
+
 def resolve_seq_file(name: str) -> Optional[Path]:
     """Map a ``param_seq_file`` value to a file in the library, or None."""
     library = library_dir()
@@ -96,7 +183,9 @@ class SequencePulseqFile(PulseqSequence, registry_key=Path(__file__).stem):
     param_seq_file = param(
         "latest",
         title="Sequence file",
-        description="File name in seq_library, or 'latest' for the last one loaded",
+        description="Choose a Pulseq .seq file, or leave as latest for the last one loaded",
+        widget="file",
+        accept=".seq",
     )
 
     @classmethod
@@ -105,13 +194,13 @@ class SequencePulseqFile(PulseqSequence, registry_key=Path(__file__).stem):
 
     @classmethod
     def get_description(cls) -> str:
-        return "Plays a .seq file loaded with scripts/load_seq.py"
+        return "Plays a Pulseq .seq file chosen in the Imaging Console"
 
     def validate_parameters(self, scan_task) -> bool:
         if resolve_seq_file(self.param_seq_file) is None:
             self.problem_list.append(
                 f"No '{self.param_seq_file}' in {library_dir()}. "
-                "Load one with scripts/load_seq.py."
+                "Choose a .seq file in the SEQUENCE tab."
             )
         return self.is_valid()
 
