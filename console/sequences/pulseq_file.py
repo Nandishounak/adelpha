@@ -218,7 +218,7 @@ class SequencePulseqFile(PulseqSequence, registry_key=Path(__file__).stem):
         self.calculated = True
         return True
 
-    def _attach_sequence_plot(self, scan_task) -> None:
+    def _attach_sequence_plot(self, scan_task, viewer: int = 1) -> None:
         """Show what MaRCoS was sent, using run_pulseq's own interpretation."""
         try:
             channels = _channels_from_axes(plt.gcf())
@@ -237,17 +237,56 @@ class SequencePulseqFile(PulseqSequence, registry_key=Path(__file__).stem):
             result.name = "Sequence"
             result.description = "Instructions sent to MaRCoS (values held between updates)"
             result.type = "plot"
-            result.primary = True
-            result.autoload_viewer = 1
+            result.primary = viewer == 1
+            result.autoload_viewer = viewer
             result.file_path = "other/sequence.plot"
             scan_task.results.insert(0, result)
         except Exception as exc:  # a plot must never fail the scan
             log.warning("Could not plot sequence instructions: %s", exc)
 
+    def _attach_signal_plot(self, scan_task, rxd, rx_t_us) -> None:
+        """Plot the acquired signal and its spectrum, as FID does."""
+        try:
+            rxd = np.asarray(rxd).ravel()
+            dwell_s = float(rx_t_us) * 1e-6
+            t_ms = np.arange(rxd.size) * dwell_s * 1e3   # all ADC windows, back to back
+            freq_khz = np.fft.fftshift(np.fft.fftfreq(rxd.size, dwell_s)) / 1e3
+            spectrum = np.abs(np.fft.fftshift(np.fft.fft(rxd)))
+
+            fig, (ax_t, ax_f) = plt.subplots(2, 1, figsize=(10, 6), constrained_layout=True)
+            ax_t.plot(t_ms, np.abs(rxd), lw=0.8, label="|signal|")
+            ax_t.set_title("Acquired signal")
+            ax_t.set_xlabel("sample time (ms, ADC windows concatenated)")
+            ax_t.set_ylabel("magnitude")
+            ax_f.plot(freq_khz, spectrum, lw=0.8, label="|FFT|")
+            ax_f.set_title("Spectrum")
+            ax_f.set_xlabel("offset from Larmor (kHz)")
+            ax_f.set_ylabel("magnitude")
+            for ax in (ax_t, ax_f):
+                ax.grid(True, alpha=0.3)
+                ax.legend(fontsize=8)
+
+            other = os.path.join(self.get_working_folder(), "other")
+            os.makedirs(other, exist_ok=True)
+            with open(os.path.join(other, "signal.plot"), "wb") as fh:
+                pickle.dump(fig, fh)
+            plt.close(fig)
+
+            result = ResultItem()
+            result.name = "Signal"
+            result.description = "Acquired ADC signal and its spectrum"
+            result.type = "plot"
+            result.primary = True
+            result.autoload_viewer = 1
+            result.file_path = "other/signal.plot"
+            scan_task.results.insert(0, result)
+        except Exception as exc:  # a plot must never fail the scan
+            log.warning("Could not plot acquired signal: %s", exc)
+
     def run_sequence(self, scan_task) -> bool:
         log.info("Running %s", self.seq_file_path)
         plt.close("all")
-        rxd, _ = run_pulseq(
+        rxd, rx_t = run_pulseq(
             seq_file=self.seq_file_path,
             rf_center=scan_task.adjustment.rf.larmor_frequency,
             tx_t=1,
@@ -264,7 +303,11 @@ class SequencePulseqFile(PulseqSequence, registry_key=Path(__file__).stem):
             raw_filename="raw",
             plot_instructions=True,   # drawn before the hardware step, so also in simulation
         )
-        self._attach_sequence_plot(scan_task)
-        if rxd is None or getattr(rxd, "size", 0) == 0:
+        has_data = rxd is not None and getattr(rxd, "size", 0) > 0
+        # Measured signal takes viewer 1 when there is one; otherwise the sequence does.
+        self._attach_sequence_plot(scan_task, viewer=2 if has_data else 1)
+        if has_data:
+            self._attach_signal_plot(scan_task, rxd, rx_t)
+        else:
             log.info("No raw data (hardware simulation or empty acquisition)")
         return True
