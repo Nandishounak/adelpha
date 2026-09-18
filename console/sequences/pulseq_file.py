@@ -164,17 +164,63 @@ def check_seq_file(seq_path: Path, plot_path: Optional[Path] = None) -> List[str
     return problems
 
 
-def adc_windows(seq_path: Path) -> int:
-    """How many ADC events the file plays, i.e. how many readouts come back."""
+# np.trapz was removed in NumPy 2; np.trapezoid is its replacement.
+_trapezoid = getattr(np, "trapezoid", None) or np.trapz
+
+
+def _gradient_area(grad) -> float:
+    if grad is None:
+        return 0.0
+    if getattr(grad, "type", "") == "trap":
+        return float(grad.amplitude) * (
+            float(grad.rise_time) / 2 + float(grad.flat_time) + float(grad.fall_time) / 2
+        )
+    return float(_trapezoid(np.asarray(grad.waveform), np.asarray(grad.tt)))
+
+
+def _rf_flip_deg(rf) -> float:
+    """Nominal on-resonance flip angle of an RF event, in degrees."""
+    return 360.0 * float(_trapezoid(np.abs(np.asarray(rf.signal)), np.asarray(rf.t)))
+
+
+def _is_refocusing(rf) -> bool:
+    use = (getattr(rf, "use", "") or "").lower()
+    if use:
+        return use in ("refocusing", "inversion")
+    return _rf_flip_deg(rf) > 135.0     # unlabelled files: a 180 is a refocusing pulse
+
+
+def readout_layout(seq_path: Path) -> Dict[str, object]:
+    """Describe the readouts: how many, and the phase encode (ky) of each.
+
+    ky accumulates from each excitation; a refocusing pulse inverts it, as it
+    does in reality. Repeated ky values are averages, distinct ones a 2D encode.
+    """
+    layout: Dict[str, object] = {"windows": 1, "ky": []}
     try:
         import pypulseq as pp
 
         seq = pp.Sequence()
         seq.read(str(seq_path))
-        return sum(getattr(seq.get_block(i), "adc", None) is not None for i in seq.block_events)
+        ky_values, ky = [], 0.0
+        for i in seq.block_events:
+            block = seq.get_block(i)
+            rf = getattr(block, "rf", None)
+            if rf is not None:
+                ky = -ky if _is_refocusing(rf) else 0.0   # 180 inverts k, excitation restarts it
+            ky += _gradient_area(getattr(block, "gy", None))
+            if getattr(block, "adc", None) is not None:
+                ky_values.append(ky)
+        layout["windows"] = max(len(ky_values), 1)
+        layout["ky"] = ky_values
     except Exception as exc:
-        log.warning("Could not count ADC events in %s: %s", seq_path, exc)
-        return 1
+        log.warning("Could not inspect readouts in %s: %s", seq_path, exc)
+    return layout
+
+
+def adc_windows(seq_path: Path) -> int:
+    """How many ADC events the file plays, i.e. how many readouts come back."""
+    return int(readout_layout(seq_path)["windows"])
 
 
 def resolve_seq_file(name: str) -> Optional[Path]:
@@ -272,6 +318,44 @@ class SequencePulseqFile(PulseqSequence, registry_key=Path(__file__).stem):
         result.file_path = f"other/{filename}"
         scan_task.results.insert(index, result)
 
+    def _attach_image_plots(self, scan_task, kspace) -> None:
+        """k-space and image, the way the built-in 2D spin echo presents them."""
+        fig = plt.figure(figsize=(6, 6))
+        plt.title("k-space data")
+        plt.imshow(np.abs(kspace), aspect="auto")
+        plt.set_cmap("jet")
+        plt.clim(0, 1.2 * float(np.abs(kspace).max()))
+        plt.xlabel("readout")
+        plt.ylabel("phase encode")
+        self._save_plot(scan_task, fig, "kspace.plot", "k-space", "Acquired k-space", 1, 0)
+
+        image = np.fft.fftshift(np.fft.fft2(np.fft.fftshift(kspace)))
+        fig = plt.figure(figsize=(6, 6))
+        plt.title("Image data")
+        plt.imshow(np.abs(image), aspect="auto")
+        plt.set_cmap("gray")
+        self._save_plot(scan_task, fig, "image.plot", "Image",
+                        f"Reconstructed image ({kspace.shape[0]} x {kspace.shape[1]})", 2, 1)
+
+    def _reconstruct_2d(self, rxd, layout) -> Optional[np.ndarray]:
+        """Sort readouts into a k-space matrix, averaging repeats of the same ky."""
+        ky = np.asarray(layout.get("ky") or [], dtype=float)
+        windows = int(layout.get("windows", 1))
+        if ky.size != windows or windows < 2 or rxd.size % windows:
+            return None
+
+        # Round so floating-point noise does not split one ky into several.
+        scale = np.abs(ky).max() or 1.0
+        keys = np.round(ky / scale, 6)
+        unique = np.unique(keys)
+        if unique.size < 2:
+            return None                        # one ky only: averages, not an encode
+
+        lines = rxd.reshape(windows, rxd.size // windows)
+        kspace = np.stack([lines[keys == value].mean(axis=0) for value in unique])
+        log.info("Reconstructing %s x %s from %s readouts", *kspace.shape, windows)
+        return kspace
+
     def _attach_signal_plot(self, scan_task, rxd, rx_t_us) -> None:
         """Plot the acquired signal and its spectrum, as the built-in spin echo does.
 
@@ -282,7 +366,13 @@ class SequencePulseqFile(PulseqSequence, registry_key=Path(__file__).stem):
             rxd = np.asarray(rxd).ravel()
             dwell_us = float(rx_t_us)
 
-            windows = adc_windows(Path(self.seq_file_path))
+            layout = readout_layout(Path(self.seq_file_path))
+            kspace = self._reconstruct_2d(rxd, layout)
+            if kspace is not None:
+                self._attach_image_plots(scan_task, kspace)
+                return
+
+            windows = int(layout["windows"])
             if windows > 1 and rxd.size % windows == 0:
                 signal = rxd.reshape(windows, rxd.size // windows).mean(axis=0)
                 averaged = f" (average of {windows} readouts)"
@@ -339,7 +429,7 @@ class SequencePulseqFile(PulseqSequence, registry_key=Path(__file__).stem):
         )
         has_data = rxd is not None and getattr(rxd, "size", 0) > 0
         # Measured signal takes viewer 1 when there is one; otherwise the sequence does.
-        # ADC and FFT take viewers 1 and 2 when there is data, as the built-in sequences do.
+        # Data plots take viewers 1 and 2 when there is data, as the built-in sequences do.
         self._attach_sequence_plot(scan_task, viewer=3 if has_data else 1)
         if has_data:
             self._attach_signal_plot(scan_task, rxd, rx_t)
