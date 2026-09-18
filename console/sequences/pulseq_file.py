@@ -164,6 +164,19 @@ def check_seq_file(seq_path: Path, plot_path: Optional[Path] = None) -> List[str
     return problems
 
 
+def adc_windows(seq_path: Path) -> int:
+    """How many ADC events the file plays, i.e. how many readouts come back."""
+    try:
+        import pypulseq as pp
+
+        seq = pp.Sequence()
+        seq.read(str(seq_path))
+        return sum(getattr(seq.get_block(i), "adc", None) is not None for i in seq.block_events)
+    except Exception as exc:
+        log.warning("Could not count ADC events in %s: %s", seq_path, exc)
+        return 1
+
+
 def resolve_seq_file(name: str) -> Optional[Path]:
     """Map a ``param_seq_file`` value to a file in the library, or None."""
     library = library_dir()
@@ -244,42 +257,63 @@ class SequencePulseqFile(PulseqSequence, registry_key=Path(__file__).stem):
         except Exception as exc:  # a plot must never fail the scan
             log.warning("Could not plot sequence instructions: %s", exc)
 
+    def _save_plot(self, scan_task, fig, filename, name, description, viewer, index) -> None:
+        other = os.path.join(self.get_working_folder(), "other")
+        os.makedirs(other, exist_ok=True)
+        with open(os.path.join(other, filename), "wb") as fh:
+            pickle.dump(fig, fh)
+        plt.close(fig)
+        result = ResultItem()
+        result.name = name
+        result.description = description
+        result.type = "plot"
+        result.primary = viewer == 1
+        result.autoload_viewer = viewer
+        result.file_path = f"other/{filename}"
+        scan_task.results.insert(index, result)
+
     def _attach_signal_plot(self, scan_task, rxd, rx_t_us) -> None:
-        """Plot the acquired signal and its spectrum, as FID does."""
+        """Plot the acquired signal and its spectrum, as the built-in spin echo does.
+
+        Repeated readouts (averages, or a multi-TR sequence) are averaged, so one
+        echo is shown rather than the whole acquisition end to end.
+        """
         try:
             rxd = np.asarray(rxd).ravel()
-            dwell_s = float(rx_t_us) * 1e-6
-            t_ms = np.arange(rxd.size) * dwell_s * 1e3   # all ADC windows, back to back
-            freq_khz = np.fft.fftshift(np.fft.fftfreq(rxd.size, dwell_s)) / 1e3
-            spectrum = np.abs(np.fft.fftshift(np.fft.fft(rxd)))
+            dwell_us = float(rx_t_us)
 
-            fig, (ax_t, ax_f) = plt.subplots(2, 1, figsize=(10, 6), constrained_layout=True)
-            ax_t.plot(t_ms, np.abs(rxd), lw=0.8, label="|signal|")
-            ax_t.set_title("Acquired signal")
-            ax_t.set_xlabel("sample time (ms, ADC windows concatenated)")
-            ax_t.set_ylabel("magnitude")
-            ax_f.plot(freq_khz, spectrum, lw=0.8, label="|FFT|")
-            ax_f.set_title("Spectrum")
-            ax_f.set_xlabel("offset from Larmor (kHz)")
-            ax_f.set_ylabel("magnitude")
-            for ax in (ax_t, ax_f):
-                ax.grid(True, alpha=0.3)
-                ax.legend(fontsize=8)
+            windows = adc_windows(Path(self.seq_file_path))
+            if windows > 1 and rxd.size % windows == 0:
+                signal = rxd.reshape(windows, rxd.size // windows).mean(axis=0)
+                averaged = f" (average of {windows} readouts)"
+            else:
+                signal = rxd
+                averaged = ""
 
-            other = os.path.join(self.get_working_folder(), "other")
-            os.makedirs(other, exist_ok=True)
-            with open(os.path.join(other, "signal.plot"), "wb") as fh:
-                pickle.dump(fig, fh)
-            plt.close(fig)
+            duration_us = signal.size * dwell_us
+            t_us = np.arange(signal.size) * dwell_us
 
-            result = ResultItem()
-            result.name = "Signal"
-            result.description = "Acquired ADC signal and its spectrum"
-            result.type = "plot"
-            result.primary = True
-            result.autoload_viewer = 1
-            result.file_path = "other/signal.plot"
-            scan_task.results.insert(0, result)
+            fig = plt.figure(figsize=(8, 5))
+            plt.title("ADC Signal")
+            plt.grid(True, color="#333")
+            plt.plot(t_us, np.abs(signal))
+            plt.xlabel("Time [us]")
+            plt.ylabel("Signal")
+            self._save_plot(scan_task, fig, "adc.plot", "ADC",
+                            f"Acquired ADC signal{averaged}", 1, 0)
+
+            # Same transform and axis as the built-in spin echo, so the two match.
+            recon = np.fft.fftshift(np.fft.ifft(np.fft.fftshift(signal)))
+            df = 1 / duration_us                       # us -> MHz
+            freq_khz = 1e3 * np.linspace(-1 / (2 * dwell_us), 1 / (2 * dwell_us) - df, signal.size)
+
+            fig = plt.figure(figsize=(8, 5))
+            plt.title("FFT of Signal")
+            plt.grid(True, color="#333")
+            plt.plot(freq_khz, np.abs(recon))
+            plt.xlabel("Frequency [kHz]")
+            plt.ylabel("Signal")
+            self._save_plot(scan_task, fig, "fft.plot", "FFT", "FFT of ADC signal", 2, 1)
         except Exception as exc:  # a plot must never fail the scan
             log.warning("Could not plot acquired signal: %s", exc)
 
@@ -305,7 +339,8 @@ class SequencePulseqFile(PulseqSequence, registry_key=Path(__file__).stem):
         )
         has_data = rxd is not None and getattr(rxd, "size", 0) > 0
         # Measured signal takes viewer 1 when there is one; otherwise the sequence does.
-        self._attach_sequence_plot(scan_task, viewer=2 if has_data else 1)
+        # ADC and FFT take viewers 1 and 2 when there is data, as the built-in sequences do.
+        self._attach_sequence_plot(scan_task, viewer=3 if has_data else 1)
         if has_data:
             self._attach_signal_plot(scan_task, rxd, rx_t)
         else:
